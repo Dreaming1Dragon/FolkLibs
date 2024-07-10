@@ -1,6 +1,7 @@
 package render
 
 import "core:fmt"
+import "core:mem"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -66,6 +67,16 @@ foreign lib {
 	QueueSubmit::proc(queue:vk.Queue,submitCount:u32,pSubmits:[^]vk.SubmitInfo,fence:vk.Fence)->vk.Result ---
 	QueuePresentKHR::proc(queue:vk.Queue,pPresentInfo:^vk.PresentInfoKHR)->vk.Result ---
 	DeviceWaitIdle::proc(device:vk.Device)->vk.Result ---
+	CreateDescriptorSetLayout::proc(device:vk.Device,pCreateInfo:^vk.DescriptorSetLayoutCreateInfo,pAllocator:^vk.AllocationCallbacks,pSetLayout:^vk.DescriptorSetLayout)->vk.Result ---
+	DestroyDescriptorSetLayout::proc(device:vk.Device,descriptorSetLayout:vk.DescriptorSetLayout,pAllocator:^vk.AllocationCallbacks) ---
+	CreateBuffer::proc(device:vk.Device,pCreateInfo:^vk.BufferCreateInfo,pAllocator:^vk.AllocationCallbacks,pBuffer:^vk.Buffer)->vk.Result ---
+	GetBufferMemoryRequirements::proc(device:vk.Device,buffer:vk.Buffer,pMemoryRequirements:[^]vk.MemoryRequirements) ---
+	AllocateMemory::proc(device:vk.Device,pAllocateInfo:^vk.MemoryAllocateInfo,pAllocator:^vk.AllocationCallbacks,pMemory:^vk.DeviceMemory)->vk.Result ---
+	BindBufferMemory::proc(device:vk.Device,buffer:vk.Buffer,memory:vk.DeviceMemory,memoryOffset:vk.DeviceSize)->vk.Result ---
+	GetPhysicalDeviceMemoryProperties::proc(physicalDevice:vk.PhysicalDevice,pMemoryProperties:[^]vk.PhysicalDeviceMemoryProperties) ---
+	MapMemory::proc(device:vk.Device,memory:vk.DeviceMemory,offset:vk.DeviceSize,size:vk.DeviceSize,flags:vk.MemoryMapFlags,ppData:^rawptr)->vk.Result ---
+	DestroyBuffer::proc(device:vk.Device,buffer:vk.Buffer,pAllocator:^vk.AllocationCallbacks) ---
+	FreeMemory::proc(device:vk.Device,memory:vk.DeviceMemory,pAllocator:^vk.AllocationCallbacks) ---
 }
 
 CreateDebugUtilsMessengerEXT::proc(instance:vk.Instance,pCreateInfo:^vk.DebugUtilsMessengerCreateInfoEXT,pAllocator:^vk.AllocationCallbacks,pDebugMessenger:^vk.DebugUtilsMessengerEXT)->vk.Result{
@@ -111,6 +122,13 @@ quit:bool
 Pipeline::struct{
 	layout:vk.PipelineLayout,
 	pipeline:vk.Pipeline,
+}
+
+UBO::struct{
+	descriptorSetLayout:vk.DescriptorSetLayout,
+	buffers:[MAX_FRAMES_IN_FLIGHT]vk.Buffer,
+	memory:[MAX_FRAMES_IN_FLIGHT]vk.DeviceMemory,
+	mapped:[MAX_FRAMES_IN_FLIGHT]rawptr,
 }
 
 Context:struct{
@@ -329,7 +347,47 @@ DefaultViewport::proc(commandBuffer:vk.CommandBuffer){
 	CmdSetScissor(commandBuffer,0,1,&scissor)
 }
 
-CreateScreenPipeline::proc($fs:string)->(pipeline:Pipeline,ok:bool=true){
+CreateUBO::proc(size:u64)->(ubo:UBO,ok:bool=true){
+	uboLayoutBinding:vk.DescriptorSetLayoutBinding
+	uboLayoutBinding.binding=0
+	uboLayoutBinding.descriptorType=.UNIFORM_BUFFER
+	uboLayoutBinding.descriptorCount=1
+	uboLayoutBinding.stageFlags={.FRAGMENT}
+	// uboLayoutBinding.pImmutableSamplers=nil // Optional
+	layoutInfo:vk.DescriptorSetLayoutCreateInfo
+	layoutInfo.sType=.DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+	layoutInfo.bindingCount=1
+	layoutInfo.pBindings=&uboLayoutBinding
+	if(CreateDescriptorSetLayout(Context.device,&layoutInfo,nil,&ubo.descriptorSetLayout)!=.SUCCESS){
+		fmt.println("failed to create descriptor set layout!")
+		ok=false;return
+	}
+	
+	bufferSize:=vk.DeviceSize(size)
+	// uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+	// uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+	// uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+	for i in 0..<MAX_FRAMES_IN_FLIGHT{
+		createBuffer(bufferSize,{.UNIFORM_BUFFER},{.HOST_VISIBLE,.HOST_COHERENT},&ubo.buffers[i],&ubo.memory[i])
+		MapMemory(Context.device,ubo.memory[i],0,bufferSize,{},&ubo.mapped[i])
+	}
+	return
+}
+
+DestroyUBO::proc(ubo:UBO){
+	for i in 0..<MAX_FRAMES_IN_FLIGHT{
+        DestroyBuffer(Context.device,ubo.buffers[i],nil)
+        FreeMemory(Context.device,ubo.memory[i],nil)
+    }
+	DestroyDescriptorSetLayout(Context.device,ubo.descriptorSetLayout,nil)
+}
+
+UpdateUniformBuffer::proc(ubo:UBO,data:rawptr,size:int){
+	mem.copy(ubo.mapped[Context.currentFrame],data,size)
+}
+
+CreateScreenPipeline::proc($fs:string,descriptorSetLayout:Maybe(vk.DescriptorSetLayout)=nil)->(pipeline:Pipeline,ok:bool=true){
 	vs:=string(#load("screen.spv"))
 	
 	vsModule:=createShaderModule(vs) or_return
@@ -352,7 +410,7 @@ CreateScreenPipeline::proc($fs:string)->(pipeline:Pipeline,ok:bool=true){
 	fragShaderStageInfo.pName="main"
 	
 	shaderStages:=[2]vk.PipelineShaderStageCreateInfo{vertShaderStageInfo,fragShaderStageInfo}
-	return CreatePipelineFromShaderStages(shaderStages[:])
+	return CreatePipelineFromShaderStages(shaderStages[:],descriptorSetLayout)
 }
 
 CreatePipeline::proc($vs:string,$fs:string)->(pipeline:Pipeline,ok:bool=true){
@@ -382,7 +440,7 @@ CreatePipeline::proc($vs:string,$fs:string)->(pipeline:Pipeline,ok:bool=true){
 	return CreatePipelineFromShaderStages(shaderStages[:])
 }
 
-CreatePipelineFromShaderStages::proc(shaderStages:[]vk.PipelineShaderStageCreateInfo)->(pipeline:Pipeline,ok:bool=true){
+CreatePipelineFromShaderStages::proc(shaderStages:[]vk.PipelineShaderStageCreateInfo,descriptorSetLayout:Maybe(vk.DescriptorSetLayout)=nil)->(pipeline:Pipeline,ok:bool=true){
 	dynamicStates:=[?]vk.DynamicState{.VIEWPORT,.SCISSOR}
 	dynamicState:vk.PipelineDynamicStateCreateInfo
 	dynamicState.sType=.PIPELINE_DYNAMIC_STATE_CREATE_INFO
@@ -446,6 +504,11 @@ CreatePipelineFromShaderStages::proc(shaderStages:[]vk.PipelineShaderStageCreate
 
 	pipelineLayoutInfo:vk.PipelineLayoutCreateInfo
 	pipelineLayoutInfo.sType=.PIPELINE_LAYOUT_CREATE_INFO
+	if descriptorSetLayout,ok:=descriptorSetLayout.?;ok{
+		fmt.println("yeah!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		pipelineLayoutInfo.setLayoutCount=1
+		pipelineLayoutInfo.pSetLayouts=&descriptorSetLayout
+	}
 
 	if CreatePipelineLayout(Context.device,&pipelineLayoutInfo,nil,&pipeline.layout)!=.SUCCESS{
 		fmt.println("failed to create pipeline layout!")
@@ -478,6 +541,48 @@ DestroyShader::proc(pipeline:Pipeline){
 	DeviceWaitIdle(Context.device)
 	DestroyPipeline(Context.device,pipeline.pipeline,nil)
 	DestroyPipelineLayout(Context.device,pipeline.layout,nil)
+}
+
+createBuffer::proc(size:vk.DeviceSize,usage:vk.BufferUsageFlags,properties:vk.MemoryPropertyFlags,buffer:^vk.Buffer,bufferMemory:^vk.DeviceMemory)->(ok:bool=true){
+	bufferInfo:vk.BufferCreateInfo
+	bufferInfo.sType=.BUFFER_CREATE_INFO
+	bufferInfo.size=size
+	bufferInfo.usage=usage
+	bufferInfo.sharingMode=.EXCLUSIVE
+
+	if(CreateBuffer(Context.device,&bufferInfo,nil,buffer)!=.SUCCESS){
+		fmt.println("failed to create buffer!")
+		return false
+	}
+
+	memRequirements:vk.MemoryRequirements
+	GetBufferMemoryRequirements(Context.device,buffer^,&memRequirements)
+
+	allocInfo:vk.MemoryAllocateInfo
+	allocInfo.sType=.MEMORY_ALLOCATE_INFO
+	allocInfo.allocationSize=memRequirements.size
+	allocInfo.memoryTypeIndex=findMemoryType(memRequirements.memoryTypeBits,properties) or_return
+
+	if(AllocateMemory(Context.device,&allocInfo,nil,bufferMemory)!=.SUCCESS){
+		fmt.println("failed to allocate buffer memory!")
+		return false
+	}
+
+	BindBufferMemory(Context.device,buffer^,bufferMemory^,0)
+	return
+}
+
+findMemoryType::proc(typeFilter:u32,properties:vk.MemoryPropertyFlags)->(type:u32,ok:bool=true){
+	memProperties:vk.PhysicalDeviceMemoryProperties
+	GetPhysicalDeviceMemoryProperties(Context.physicalDevice,&memProperties)
+
+	for i in 0..<memProperties.memoryTypeCount{
+		if bool(typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties)==properties{
+			type=i;return
+		}
+	}
+	fmt.println("failed to find suitable memory type!")
+	ok=false;return
 }
 
 
