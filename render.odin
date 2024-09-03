@@ -75,8 +75,14 @@ foreign lib {
 	BindBufferMemory::proc(device:vk.Device,buffer:vk.Buffer,memory:vk.DeviceMemory,memoryOffset:vk.DeviceSize)->vk.Result ---
 	GetPhysicalDeviceMemoryProperties::proc(physicalDevice:vk.PhysicalDevice,pMemoryProperties:[^]vk.PhysicalDeviceMemoryProperties) ---
 	MapMemory::proc(device:vk.Device,memory:vk.DeviceMemory,offset:vk.DeviceSize,size:vk.DeviceSize,flags:vk.MemoryMapFlags,ppData:^rawptr)->vk.Result ---
+	UnmapMemory::proc(device:vk.Device,memory:vk.DeviceMemory) ---
 	DestroyBuffer::proc(device:vk.Device,buffer:vk.Buffer,pAllocator:^vk.AllocationCallbacks) ---
 	FreeMemory::proc(device:vk.Device,memory:vk.DeviceMemory,pAllocator:^vk.AllocationCallbacks) ---
+	CreateDescriptorPool::proc(device:vk.Device,pCreateInfo:^vk.DescriptorPoolCreateInfo,pAllocator:^vk.AllocationCallbacks,pDescriptorPool:^vk.DescriptorPool)->vk.Result ---
+	DestroyDescriptorPool::proc(device:vk.Device,descriptorPool:vk.DescriptorPool,pAllocator:^vk.AllocationCallbacks) ---
+	AllocateDescriptorSets::proc(device:vk.Device,pAllocateInfo:^vk.DescriptorSetAllocateInfo,pDescriptorSets:[^]vk.DescriptorSet)->vk.Result ---
+	UpdateDescriptorSets::proc(device:vk.Device,descriptorWriteCount:u32,pDescriptorWrites:[^]vk.WriteDescriptorSet,descriptorCopyCount:u32,pDescriptorCopies:[^]vk.CopyDescriptorSet) ---
+	CmdBindDescriptorSets::proc(commandBuffer:vk.CommandBuffer,pipelineBindPoint:vk.PipelineBindPoint,layout:vk.PipelineLayout,firstSet:u32,descriptorSetCount:u32,pDescriptorSets:[^]vk.DescriptorSet,dynamicOffsetCount:u32,pDynamicOffsets:[^]u32) ---
 }
 
 CreateDebugUtilsMessengerEXT::proc(instance:vk.Instance,pCreateInfo:^vk.DebugUtilsMessengerCreateInfoEXT,pAllocator:^vk.AllocationCallbacks,pDebugMessenger:^vk.DebugUtilsMessengerEXT)->vk.Result{
@@ -119,18 +125,31 @@ quit:bool
 // @(private="file")
 // resolutionLoc:i32
 
+BufferData::struct{
+	layoutBinding:vk.DescriptorSetLayoutBinding,
+	size:vk.DeviceSize,
+	type:vk.DescriptorType,
+}
+
+Buffer::struct{
+	buffer:vk.Buffer,
+	memory:vk.DeviceMemory,
+	mapped:rawptr,
+}
+
 Pipeline::struct{
+	buffers:#soa[dynamic]BufferData,
 	layout:vk.PipelineLayout,
 	pipeline:vk.Pipeline,
-}
-
-UBO::struct{
 	descriptorSetLayout:vk.DescriptorSetLayout,
-	buffers:[MAX_FRAMES_IN_FLIGHT]vk.Buffer,
-	memory:[MAX_FRAMES_IN_FLIGHT]vk.DeviceMemory,
-	mapped:[MAX_FRAMES_IN_FLIGHT]rawptr,
+	descriptorPool:vk.DescriptorPool,
+	frames:#soa[MAX_FRAMES_IN_FLIGHT]struct{
+		descriptorSet:vk.DescriptorSet,
+		buffers:[dynamic]Buffer
+	}
 }
 
+// @(private="file")
 Context:struct{
 	instance:vk.Instance,
 	debugMessenger:vk.DebugUtilsMessengerEXT,
@@ -172,8 +191,21 @@ window:glfw.WindowHandle
 GL_MAJOR_VERSION::4
 GL_MINOR_VERSION::3
 
+ResizeCallbackStruct::struct{
+	resized:^bool,
+	resolution:^[2]f32,
+}
+
+ResizeCallbackData:=ResizeCallbackStruct{
+	resized=&Context.framebufferResized,
+	resolution=&resolution,
+}
+
 framebufferResizeCallback::proc"c"(window:glfw.WindowHandle,width:i32,height:i32){
-	(^bool)(glfw.GetWindowUserPointer(window))^=true
+	data:=(^ResizeCallbackStruct)(glfw.GetWindowUserPointer(window))
+	data.resized^=true
+	data.resolution^={f32(width),f32(height)}
+	// (^bool)(glfw.GetWindowUserPointer(window))^=true
 }
 
 InitWindow::proc(width,height:i32,name:cstring)->(ok:bool=true){
@@ -197,17 +229,17 @@ InitWindow::proc(width,height:i32,name:cstring)->(ok:bool=true){
 		return false
 	}
 	defer if !ok do glfw.DestroyWindow(window)
-	// resolution={f32(width),f32(height)}
+	resolution={f32(width),f32(height)}
 	
 	glfw.SetFramebufferSizeCallback(window,framebufferResizeCallback)
-	glfw.SetWindowUserPointer(window,&Context.framebufferResized)
+	glfw.SetWindowUserPointer(window,&ResizeCallbackData)
 	// glfw.MakeContextCurrent(window)
 	// glfw.SwapInterval(1)
 	// gl.load_up_to(int(GL_MAJOR_VERSION),GL_MINOR_VERSION,glfw.gl_set_proc_address)
 	// VAO,VBO=ScreenVerts()
 	
-	// glfw.SetKeyCallback(window,key_callback)
-	// glfw.SetCursorPosCallback(window,mouse_callback)
+	glfw.SetKeyCallback(window,key_callback)
+	glfw.SetCursorPosCallback(window,mouse_callback)
 	// glfw.SetFramebufferSizeCallback(window,size_callback)
 	
 	// resolution=[2]f32{f32(width),f32(height)}
@@ -230,8 +262,10 @@ BeginDrawing::proc(color:[4]f32){
 	using Context
 	sync:=&frames[currentFrame].sync
 	commandBuffer:=&frames[currentFrame].commandBuffer
+	
 	WaitForFences(device,1,&sync.inFlight,true,UINT64_MAX)
 	result:=AcquireNextImageKHR(device,swap.chain,UINT64_MAX,sync.image,0,&imageIndex)
+	
 	if(result==.ERROR_OUT_OF_DATE_KHR){
 		recreateSwapChain()
 		return
@@ -240,6 +274,7 @@ BeginDrawing::proc(color:[4]f32){
 		// return false
 		quit=true
 	}
+	
 	ResetFences(device,1,&sync.inFlight)
 	ResetCommandBuffer(commandBuffer^,{})
 	
@@ -313,12 +348,13 @@ EndDrawing::proc(){
 	quit|=bool(glfw.WindowShouldClose(window))
 }
 
-BeginShaderMode::proc(pipeline:Pipeline){
+BeginShaderMode::proc(pipeline:^Pipeline){
 	using Context
 	sync:=&frames[currentFrame].sync
 	commandBuffer:=&frames[currentFrame].commandBuffer
 	
 	CmdBindPipeline(commandBuffer^,.GRAPHICS,pipeline.pipeline)
+	CmdBindDescriptorSets(commandBuffer^,.GRAPHICS,pipeline.layout,0,1,&pipeline.frames.descriptorSet[currentFrame],0,nil)
 	DefaultViewport(commandBuffer^)
 }
 
@@ -347,47 +383,204 @@ DefaultViewport::proc(commandBuffer:vk.CommandBuffer){
 	CmdSetScissor(commandBuffer,0,1,&scissor)
 }
 
-CreateUBO::proc(size:u64)->(ubo:UBO,ok:bool=true){
-	uboLayoutBinding:vk.DescriptorSetLayoutBinding
-	uboLayoutBinding.binding=0
-	uboLayoutBinding.descriptorType=.UNIFORM_BUFFER
-	uboLayoutBinding.descriptorCount=1
-	uboLayoutBinding.stageFlags={.FRAGMENT}
-	// uboLayoutBinding.pImmutableSamplers=nil // Optional
+// createDescriptorSets::proc()->(ok:bool=true){
+// 	using Context
+// 	layouts:[MAX_FRAMES_IN_FLIGHT]vk.DescriptorSetLayout//TODO: descriptorSetLayout
+// 	allocInfo:vk.DescriptorSetAllocateInfo
+// 	allocInfo.sType=.DESCRIPTOR_SET_ALLOCATE_INFO
+// 	allocInfo.descriptorPool=descriptorPool
+// 	allocInfo.descriptorSetCount=MAX_FRAMES_IN_FLIGHT
+// 	allocInfo.pSetLayouts=&layouts[0]
+// 	if AllocateDescriptorSets(device,&allocInfo,&frames.descriptorSet[0])!=.SUCCESS {
+// 		fmt.println("failed to allocate descriptor sets!")
+// 		return false
+// 	}
+// 	for i in 0..<MAX_FRAMES_IN_FLIGHT{
+// 		bufferInfo:vk.DescriptorBufferInfo
+// 		bufferInfo.buffer=uniformBuffers[i]
+// 		bufferInfo.offset=0
+// 		bufferInfo.range=size_of(UniformBufferObject)
+// 		descriptorWrite:vk.WriteDescriptorSet
+// 		descriptorWrite.sType=.WRITE_DESCRIPTOR_SET
+// 		descriptorWrite.dstSet=&frames.descriptorSet[i]
+// 		descriptorWrite.dstBinding=0
+// 		descriptorWrite.dstArrayElement=0
+// 		descriptorWrite.descriptorType=.UNIFORM_BUFFER
+// 		descriptorWrite.descriptorCount=1
+// 		descriptorWrite.pBufferInfo=&bufferInfo
+// 		UpdateDescriptorSets(device,1,&descriptorWrite,0,nil)
+// 	}
+// 	return
+// }
+
+// createDescriptorPool::proc()->(ok:bool=true){
+// 	using Context
+// 	poolSize:vk.DescriptorPoolSize
+// 	poolSize.type=.UNIFORM_BUFFER
+// 	poolSize.descriptorCount=MAX_FRAMES_IN_FLIGHT
+// 	poolInfo:vk.DescriptorPoolCreateInfo
+// 	poolInfo.sType=.DESCRIPTOR_POOL_CREATE_INFO
+// 	poolInfo.poolSizeCount=1
+// 	poolInfo.pPoolSizes=&poolSize
+// 	poolInfo.maxSets=MAX_FRAMES_IN_FLIGHT
+// 	if CreateDescriptorPool(device,&poolInfo,nil,&descriptorPool)!=.SUCCESS{
+// 		fmt.println("failed to create descriptor pool!")
+// 		return false
+// 	}
+// 	return
+// }
+
+CreatePipeline::proc()->(pipeline:Pipeline,ok:bool=true){
+	using Context
+	return
+}
+
+MakeSSBO::proc(pipeline:^Pipeline,size:int,binding:u32){
+	layoutBinding:vk.DescriptorSetLayoutBinding
+	layoutBinding.binding=binding
+	layoutBinding.descriptorCount=1
+	layoutBinding.descriptorType=.STORAGE_BUFFER
+	layoutBinding.stageFlags={.FRAGMENT}
+	// layoutBinding.pImmutableSamplers=nil // Optional
+	bufferSize:=vk.DeviceSize(size)
+	append(&pipeline.buffers,BufferData{
+		layoutBinding=layoutBinding,
+		size=bufferSize,
+		type=.STORAGE_BUFFER,
+	})
+
+	for i in 0..<MAX_FRAMES_IN_FLIGHT{
+		last:=len(pipeline.frames[i].buffers)
+		append(&pipeline.frames[i].buffers,Buffer{})
+		createBuffer(bufferSize,{.STORAGE_BUFFER},{.HOST_VISIBLE,.HOST_COHERENT},&pipeline.frames[i].buffers[last].buffer,&pipeline.frames[i].buffers[last].memory)
+		// MapMemory(Context.device,pipeline.frames[i].buffers[last].memory,0,bufferSize,{},&pipeline.frames[i].buffers[last].mapped)
+	}
+}
+
+MakeUBO::proc(pipeline:^Pipeline,size:int,binding:u32){
+	layoutBinding:vk.DescriptorSetLayoutBinding
+	layoutBinding.binding=binding
+	layoutBinding.descriptorCount=1
+	layoutBinding.descriptorType=.UNIFORM_BUFFER
+	layoutBinding.stageFlags={.FRAGMENT}
+	// layoutBinding.pImmutableSamplers=nil // Optional
+	bufferSize:=vk.DeviceSize(size)
+	append(&pipeline.buffers,BufferData{
+		layoutBinding=layoutBinding,
+		size=bufferSize,
+		type=.UNIFORM_BUFFER,
+	})
+
+	for i in 0..<MAX_FRAMES_IN_FLIGHT{
+		last:=len(pipeline.frames[i].buffers)
+		append(&pipeline.frames[i].buffers,Buffer{})
+		createBuffer(bufferSize,{.UNIFORM_BUFFER},{.HOST_VISIBLE,.HOST_COHERENT},&pipeline.frames[i].buffers[last].buffer,&pipeline.frames[i].buffers[last].memory)
+		// MapMemory(Context.device,pipeline.frames[i].buffers[last].memory,0,bufferSize,{},&pipeline.frames[i].buffers[last].mapped)
+	}
+}
+
+MakeBuffers::proc(pipeline:^Pipeline)->(ok:bool=true){
 	layoutInfo:vk.DescriptorSetLayoutCreateInfo
 	layoutInfo.sType=.DESCRIPTOR_SET_LAYOUT_CREATE_INFO
-	layoutInfo.bindingCount=1
-	layoutInfo.pBindings=&uboLayoutBinding
-	if(CreateDescriptorSetLayout(Context.device,&layoutInfo,nil,&ubo.descriptorSetLayout)!=.SUCCESS){
+	layoutInfo.bindingCount=u32(len(pipeline.buffers))
+	layoutInfo.pBindings=&pipeline.buffers.layoutBinding[0]
+	if(CreateDescriptorSetLayout(Context.device,&layoutInfo,nil,&pipeline.descriptorSetLayout)!=.SUCCESS){
 		fmt.println("failed to create descriptor set layout!")
 		ok=false;return
 	}
 	
-	bufferSize:=vk.DeviceSize(size)
-	// uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
-	// uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
-	// uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
-
+	buffers:[dynamic][dynamic]BufferData
+	defer{
+		for buffer in buffers{
+			delete(buffer)
+		}
+		delete(buffers)
+	}
+	outer:for buffer in pipeline.buffers{
+		for &pool in buffers{
+			if pool[0].type==buffer.type{
+				append(&pool,buffer)
+				continue outer
+			}
+		}
+		pool:[dynamic]BufferData
+		append(&pool,buffer)
+		append(&buffers,pool)
+	}
+	poolSizes:=make([]vk.DescriptorPoolSize,len(buffers))
+	defer delete(poolSizes)
+	for &poolSize,i in poolSizes{
+		poolSize.type=buffers[i][0].type
+		poolSize.descriptorCount=MAX_FRAMES_IN_FLIGHT*u32(len(buffers[i]))
+	}
+	poolInfo:vk.DescriptorPoolCreateInfo
+	poolInfo.sType=.DESCRIPTOR_POOL_CREATE_INFO
+	poolInfo.poolSizeCount=u32(len(poolSizes))
+	poolInfo.pPoolSizes=&poolSizes[0]
+	poolInfo.maxSets=MAX_FRAMES_IN_FLIGHT
+	if CreateDescriptorPool(Context.device,&poolInfo,nil,&pipeline.descriptorPool)!=.SUCCESS{
+		fmt.println("failed to create descriptor pool!")
+		ok=false;return
+	}
+	
+	layouts:[MAX_FRAMES_IN_FLIGHT]vk.DescriptorSetLayout
+	for &layout in layouts do layout=pipeline.descriptorSetLayout
+	allocInfo:vk.DescriptorSetAllocateInfo
+	allocInfo.sType=.DESCRIPTOR_SET_ALLOCATE_INFO
+	allocInfo.descriptorPool=pipeline.descriptorPool
+	allocInfo.descriptorSetCount=MAX_FRAMES_IN_FLIGHT
+	allocInfo.pSetLayouts=&layouts[0]
+	if AllocateDescriptorSets(Context.device,&allocInfo,&pipeline.frames.descriptorSet[0])!=.SUCCESS {
+		fmt.println("failed to allocate descriptor sets!")
+		return false
+	}
 	for i in 0..<MAX_FRAMES_IN_FLIGHT{
-		createBuffer(bufferSize,{.UNIFORM_BUFFER},{.HOST_VISIBLE,.HOST_COHERENT},&ubo.buffers[i],&ubo.memory[i])
-		MapMemory(Context.device,ubo.memory[i],0,bufferSize,{},&ubo.mapped[i])
+		bufferInfo:=make([]vk.DescriptorBufferInfo,len(pipeline.buffers))
+		defer delete(bufferInfo)
+		descriptorWrites:=make([]vk.WriteDescriptorSet,len(pipeline.buffers))
+		defer delete(descriptorWrites)
+		for j in 0..<len(pipeline.buffers){
+			bufferInfo[j].buffer=pipeline.frames[i].buffers[j].buffer
+			bufferInfo[j].offset=0
+			bufferInfo[j].range=pipeline.buffers[j].size
+			descriptorWrites[j].sType=.WRITE_DESCRIPTOR_SET
+			descriptorWrites[j].dstSet=pipeline.frames[i].descriptorSet
+			descriptorWrites[j].dstBinding=u32(j)
+			descriptorWrites[j].dstArrayElement=0
+			descriptorWrites[j].descriptorType=pipeline.buffers[j].type
+			descriptorWrites[j].descriptorCount=1
+			descriptorWrites[j].pBufferInfo=&bufferInfo[j]
+		}
+		UpdateDescriptorSets(Context.device,u32(len(pipeline.buffers)),&descriptorWrites[0],0,nil)
 	}
 	return
 }
 
-DestroyUBO::proc(ubo:UBO){
+DestroyBuffers::proc(pipeline:Pipeline){
+	DeviceWaitIdle(Context.device)
 	for i in 0..<MAX_FRAMES_IN_FLIGHT{
-        DestroyBuffer(Context.device,ubo.buffers[i],nil)
-        FreeMemory(Context.device,ubo.memory[i],nil)
-    }
-	DestroyDescriptorSetLayout(Context.device,ubo.descriptorSetLayout,nil)
+		for buffer in pipeline.frames[i].buffers{
+			DestroyBuffer(Context.device,buffer.buffer,nil)
+			FreeMemory(Context.device,buffer.memory,nil)
+		}
+		delete(pipeline.frames[i].buffers)
+	}
+	delete(pipeline.buffers)
+	// DestroyDes
+	DestroyDescriptorPool(Context.device,pipeline.descriptorPool,nil)
+	DestroyDescriptorSetLayout(Context.device,pipeline.descriptorSetLayout,nil)
 }
 
-UpdateUniformBuffer::proc(ubo:UBO,data:rawptr,size:int){
-	mem.copy(ubo.mapped[Context.currentFrame],data,size)
+UpdateBuffer::proc(pipeline:^Pipeline,ind:int,data:rawptr,size:int){
+	// TODO: only map memory here?
+	dst:rawptr
+	MapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory,0,vk.DeviceSize(size),{},&dst)
+	// mem.copy(pipeline.frames[Context.currentFrame].buffers[ind].mapped,data,size)
+	mem.copy(dst,data,size)
+	UnmapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory)
 }
 
-CreateScreenPipeline::proc($fs:string,descriptorSetLayout:Maybe(vk.DescriptorSetLayout)=nil)->(pipeline:Pipeline,ok:bool=true){
+MakeScreenPipeline::proc(pipeline:^Pipeline,$fs:string)->(ok:bool=true){
 	vs:=string(#load("screen.spv"))
 	
 	vsModule:=createShaderModule(vs) or_return
@@ -410,10 +603,10 @@ CreateScreenPipeline::proc($fs:string,descriptorSetLayout:Maybe(vk.DescriptorSet
 	fragShaderStageInfo.pName="main"
 	
 	shaderStages:=[2]vk.PipelineShaderStageCreateInfo{vertShaderStageInfo,fragShaderStageInfo}
-	return CreatePipelineFromShaderStages(shaderStages[:],descriptorSetLayout)
+	return MakePipelineFromShaderStages(pipeline,shaderStages[:])
 }
 
-CreatePipeline::proc($vs:string,$fs:string)->(pipeline:Pipeline,ok:bool=true){
+MakePipeline::proc(pipeline:^Pipeline,$vs:string,$fs:string)->(ok:bool=true){
 	// vs:=string(#load(vspath))
 	// fs:=string(#load(fspath))
 	
@@ -437,10 +630,11 @@ CreatePipeline::proc($vs:string,$fs:string)->(pipeline:Pipeline,ok:bool=true){
 	fragShaderStageInfo.pName="main"
 	
 	shaderStages:=[2]vk.PipelineShaderStageCreateInfo{vertShaderStageInfo,fragShaderStageInfo}
-	return CreatePipelineFromShaderStages(shaderStages[:])
+	return MakePipelineFromShaderStages(pipeline,shaderStages[:])
 }
 
-CreatePipelineFromShaderStages::proc(shaderStages:[]vk.PipelineShaderStageCreateInfo,descriptorSetLayout:Maybe(vk.DescriptorSetLayout)=nil)->(pipeline:Pipeline,ok:bool=true){
+MakePipelineFromShaderStages::proc(pipeline:^Pipeline,shaderStages:[]vk.PipelineShaderStageCreateInfo)->(ok:bool=true){
+	MakeBuffers(pipeline) or_return
 	dynamicStates:=[?]vk.DynamicState{.VIEWPORT,.SCISSOR}
 	dynamicState:vk.PipelineDynamicStateCreateInfo
 	dynamicState.sType=.PIPELINE_DYNAMIC_STATE_CREATE_INFO
@@ -504,11 +698,10 @@ CreatePipelineFromShaderStages::proc(shaderStages:[]vk.PipelineShaderStageCreate
 
 	pipelineLayoutInfo:vk.PipelineLayoutCreateInfo
 	pipelineLayoutInfo.sType=.PIPELINE_LAYOUT_CREATE_INFO
-	if descriptorSetLayout,ok:=descriptorSetLayout.?;ok{
-		fmt.println("yeah!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	// if pipeline.descriptorSetLayout!=nil{
 		pipelineLayoutInfo.setLayoutCount=1
-		pipelineLayoutInfo.pSetLayouts=&descriptorSetLayout
-	}
+		pipelineLayoutInfo.pSetLayouts=&pipeline.descriptorSetLayout
+	// }
 
 	if CreatePipelineLayout(Context.device,&pipelineLayoutInfo,nil,&pipeline.layout)!=.SUCCESS{
 		fmt.println("failed to create pipeline layout!")
@@ -623,6 +816,7 @@ cleanupSwapChain::proc(){
 		imageView:=image.view
 		DestroyImageView(device,imageView,nil)
 	}
+	delete(swap.images)
 	DestroySwapchainKHR(device,swap.chain,nil)
 }
 
@@ -665,6 +859,9 @@ initVulkan::proc()->(ok:bool=true){
 	defer if !ok{
 		DestroyCommandPool(device,commandPool,nil)
 	}
+	// createDescriptorPool() or_return
+	// defer if !ok do DestroyDescriptorPool(device,descriptorPool,nil)
+	// createDescriptorSets() or_return
 	createCommandBuffers() or_return
 	createSyncObjects() or_return
 	defer if !ok{
@@ -685,10 +882,10 @@ closeVulkan::proc(){
 		DestroySemaphore(device,frames[i].sync.render,nil)
 		DestroyFence(device,frames[i].sync.inFlight,nil)
 	}
+	// DestroyDescriptorPool(device,descriptorPool,nil)
 	DestroyCommandPool(device,commandPool,nil)
 	DestroyRenderPass(device,renderPass,nil)
 	cleanupSwapChain()
-	delete(swap.images)
 	DestroyDevice(device,nil)
 	if enableValidationLayers{
 		DestroyDebugUtilsMessengerEXT(instance,debugMessenger,nil)
@@ -841,6 +1038,10 @@ createImageViews::proc()->(ok:bool=true){
 createSwapChain::proc()->(ok:bool=true){
 	using Context
 	swapChainSupport:=querySwapChainSupport(physicalDevice)
+	defer{
+		delete(swapChainSupport.formats)
+		delete(swapChainSupport.presentModes)
+	}
 	surfaceFormat:=chooseSwapSurfaceFormat(swapChainSupport.formats)
 	presentMode:=chooseSwapPresentMode(swapChainSupport.presentModes)
 	swap.extent=chooseSwapExtent(swapChainSupport.capabilities)
@@ -1039,6 +1240,7 @@ checkValidationLayerSupport::proc()->bool{
 	layerCount:u32
 	EnumerateInstanceLayerProperties(&layerCount,nil)
 	availableLayers:=make([]vk.LayerProperties,layerCount)
+	defer delete(availableLayers)
 	EnumerateInstanceLayerProperties(&layerCount,raw_data(availableLayers))
 	for layerName in validationLayers{
 		layerFound:=false
@@ -1091,6 +1293,7 @@ isDeviceSuitable::proc(device:vk.PhysicalDevice)->bool{
 	swapChainAdequate:bool
 	if extensionsSupported{
 		swapChainSupport:=querySwapChainSupport(device)
+		// defer delete(swapChainSupport.formats)
 		swapChainAdequate=len(swapChainSupport.formats)>0 && len(swapChainSupport.presentModes)>0
 		SwapChainSupportDetailsDestroy(swapChainSupport)
 	}
