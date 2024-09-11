@@ -571,12 +571,37 @@ DestroyBuffers::proc(pipeline:Pipeline){
 	DestroyDescriptorSetLayout(Context.device,pipeline.descriptorSetLayout,nil)
 }
 
-UpdateBuffer::proc(pipeline:^Pipeline,ind:int,data:rawptr,size:int){
+UpdateBuffer::proc(pipeline:^Pipeline,ind:int,data:rawptr,size:int,offset:int=0){
 	// TODO: only map memory here?
+	if size==0 do return
 	dst:rawptr
-	MapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory,0,vk.DeviceSize(size),{},&dst)
+	MapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory,vk.DeviceSize(offset),vk.DeviceSize(size),{},&dst)
 	// mem.copy(pipeline.frames[Context.currentFrame].buffers[ind].mapped,data,size)
 	mem.copy(dst,data,size)
+	UnmapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory)
+}
+
+GetFromBuffer::proc(pipeline:^Pipeline,ind:int,data:rawptr,size:int,offset:int=0){
+	// TODO: only map memory here?
+	if size==0 do return
+	dst:rawptr
+	MapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory,vk.DeviceSize(offset),vk.DeviceSize(size),{},&dst)
+	// mem.copy(pipeline.frames[Context.currentFrame].buffers[ind].mapped,data,size)
+	mem.copy(data,dst,size)
+	UnmapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory)
+}
+
+GetVecFromBuffer::proc(pipeline:^Pipeline,ind:int,data:rawptr,count:int,stride:int,offset:int=0,size:int=0){
+	// TODO: only map memory here?
+	if stride*count==0 do return
+	size:=size
+	if size==0 do size=stride
+	dst:rawptr
+	MapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory,vk.DeviceSize(offset),vk.DeviceSize(stride*(count-1)),{},&dst)
+	// mem.copy(pipeline.frames[Context.currentFrame].buffers[ind].mapped,data,size)
+	for i in 0..<count{
+		mem.copy(&([^]byte)(data)[i*size],&([^]byte)(dst)[i*stride],size)
+	}
 	UnmapMemory(Context.device,pipeline.frames[Context.currentFrame].buffers[ind].memory)
 }
 
